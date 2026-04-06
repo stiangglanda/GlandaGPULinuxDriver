@@ -48,30 +48,27 @@
 #define CMD_LINE    (0x3)
 #define CTRL_START  (1 << 4)
 
-static struct glanda_device *g_gdev = NULL;
-
 struct glanda_device {
-    void __iomem *mmio_base;    // Pointer (4 Byte)
-    void __iomem *vram_base;    // Pointer zuerst (4 Byte)
-    struct device *dev;         // Pointer (4 Byte)
-    phys_addr_t vram_phys;      // phys_addr_t kann 4 oder 8 Byte sein -> ans Ende!
-    
+    struct device *dev;
+    void __iomem *vram_base;
+    phys_addr_t vram_phys;
+    void __iomem *mmio_base;
+
     int irq;
     wait_queue_head_t cmd_wq;
     bool cmd_done;
 
+    // Char Device
     dev_t cdev_num;
     struct cdev cdev;
     struct class *class;
+
     struct mutex lock;
 };
 
 static irqreturn_t glanda_irq_handler(int irq, void *dev_id)
 {
     struct glanda_device *gdev = dev_id;
-    if (!gdev || !gdev->mmio_base) {
-        return IRQ_NONE;
-    }
     u32 isr = readl(gdev->mmio_base + REG_ISR);
 
     if (!isr) {
@@ -294,7 +291,7 @@ static int glanda_mmap(struct file *file, struct vm_area_struct *vma)
         return -EINVAL;
 
     // Use non-cached for IO memory
-    vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+    vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot); 
 
     if (remap_pfn_range(vma, vma->vm_start, 
                         gdev->vram_phys >> PAGE_SHIFT, // Convert physical address to PFN (Page Frame Number)
@@ -307,8 +304,8 @@ static int glanda_mmap(struct file *file, struct vm_area_struct *vma)
 static int glanda_open(struct inode *inode, struct file *file)
 {
     // get device pointer
-    if (!g_gdev) return -ENODEV;
-    file->private_data = g_gdev; 
+    struct glanda_device *gdev = container_of(inode->i_cdev, struct glanda_device, cdev);
+    file->private_data = gdev; // save for ioctl
     return 0;
 }
 
@@ -332,7 +329,6 @@ static int glandagpu_probe(struct platform_device *pdev)
     if (!gdev) {
         return -ENOMEM;
     }
-    g_gdev = gdev; 
     gdev->dev = &pdev->dev;
     platform_set_drvdata(pdev, gdev);
 
@@ -342,40 +338,54 @@ static int glandagpu_probe(struct platform_device *pdev)
     init_waitqueue_head(&gdev->cmd_wq);
     gdev->irq = -1;
 
-    // Map VRAM
-    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-    if (!res) return -ENODEV;
-    gdev->vram_phys = res->start;
-    gdev->vram_base = devm_ioremap(&pdev->dev, res->start, GLANDA_VRAM_SIZE);
-    gdev->mmio_base = devm_ioremap(&pdev->dev, res->start + GLANDA_MMIO_OFFSET, GLANDA_MMIO_SIZE);
-    
-    if (!gdev->vram_base || !gdev->mmio_base) return -ENOMEM;
-
-    // 2. Hardware in einen sicheren Zustand bringen (Interrupts aus)
-    writel(0, gdev->mmio_base + REG_IER);
-    writel(0xFFFFFFFF, gdev->mmio_base + REG_ISR); // Alle alten Flags löschen
-
-    // 3. IRQ Nummer vom System abfragen
+    // Fetch IRQ
     ret = platform_get_irq(pdev, 0);
     if (ret > 0) {
         gdev->irq = ret;
-        // 4. Handler registrieren (CPU ist jetzt bereit)
         ret = devm_request_irq(&pdev->dev, gdev->irq, glanda_irq_handler,
                                IRQF_SHARED, "glandagpu", gdev);
         if (ret) {
             dev_err(&pdev->dev, "Failed to request IRQ %d\n", gdev->irq);
             return ret;
         }
-        
-        // 5. ERST JETZT den Interrupt in der Hardware erlauben
-        writel(INT_DONE, gdev->mmio_base + REG_IER);
-        dev_info(&pdev->dev, "IRQ %d requested and enabled\n", gdev->irq);
+        dev_info(&pdev->dev, "IRQ %d requested successfully\n", gdev->irq);
     } else {
-        dev_warn(&pdev->dev, "No IRQ found, falling back to polling\n");
+        dev_warn(&pdev->dev, "No IRQ found, driver will fall back to polling\n");
     }
 
-    // 6. Restliche Initialisierung (memset, char device...)
-    // memset_io(gdev->vram_base, 0, GLANDA_VRAM_SIZE); 
+    // Map VRAM
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    if (!res) {
+        dev_err(&pdev->dev, "Failed to get VRAM/MMIO resource\n");
+        return -ENODEV;
+    }
+    gdev->vram_phys = res->start;
+    gdev->vram_base = devm_ioremap(&pdev->dev, res->start, GLANDA_VRAM_SIZE);
+    if (!gdev->vram_base) {
+        return -ENOMEM;
+    }
+    dev_info(&pdev->dev, "VRAM mapped at 0x%p\n", gdev->vram_base);
+
+    // Map MMIO
+    gdev->mmio_base = devm_ioremap(&pdev->dev, res->start + GLANDA_MMIO_OFFSET, GLANDA_MMIO_SIZE);
+    if (!gdev->mmio_base) {
+        return -ENOMEM;
+    }
+    dev_info(&pdev->dev, "MMIO mapped at 0x%p\n", gdev->mmio_base);
+
+    writel(0, gdev->mmio_base + REG_IER);
+    writel(INT_DONE | INT_VSYNC, gdev->mmio_base + REG_ISR);
+    
+    if (gdev->irq >= 0) {
+        // Enable Done Interrupt
+        writel(INT_DONE, gdev->mmio_base + REG_IER);
+    }
+
+    // rendering Test
+    dev_info(&pdev->dev, "Start Test\n");
+
+    // Clear screen (CPU)
+    memset_io(gdev->vram_base, 0, GLANDA_VRAM_SIZE); 
 
     // Char Device
     ret = alloc_chrdev_region(&gdev->cdev_num, 0, 1, "glandagpu");
@@ -394,7 +404,7 @@ static int glandagpu_probe(struct platform_device *pdev)
     }
 
     // Create sysfs class and trigger udev to automatically create /dev/glandagpu
-    gdev->class = class_create(THIS_MODULE, "glanda_class");
+    gdev->class = class_create("glanda_class");
     if (IS_ERR(gdev->class)) {
         cdev_del(&gdev->cdev);
         unregister_chrdev_region(gdev->cdev_num, 1);
@@ -407,7 +417,7 @@ static int glandagpu_probe(struct platform_device *pdev)
     return 0;
 }
 
-static int glandagpu_remove(struct platform_device *pdev)
+static void glandagpu_remove(struct platform_device *pdev)
 {
     struct glanda_device *gdev = platform_get_drvdata(pdev);
 
@@ -421,7 +431,6 @@ static int glandagpu_remove(struct platform_device *pdev)
     unregister_chrdev_region(gdev->cdev_num, 1);
 
     dev_info(&pdev->dev, "Driver removed\n");
-    return 0;
 }
 
 // Device Tree Match
@@ -440,6 +449,24 @@ static struct platform_driver glandagpu_driver = {
     .remove = glandagpu_remove,
 };
 
+// Device Registration only for x86 TODO use device tree for ARM
+#ifdef CONFIG_X86
+static struct platform_device *pdev_x86;
+
+static struct resource glandagpu_resources[] = {
+    [0] = { // Single Resource covering VRAM and MMIO
+        .start = BRIDGE_BASE,
+        .end   = GLANDA_BASE_SIZE, // Size from DTS
+        .flags = IORESOURCE_MEM,
+    },
+    [1] = { // IRQ
+        .start = 11,
+        .end   = 11,
+        .flags = IORESOURCE_IRQ,
+    },
+};
+#endif
+
 static int __init glandagpu_init(void)
 {
     int ret;
@@ -450,12 +477,28 @@ static int __init glandagpu_init(void)
         return ret;
     }
 
+    // Device Registration only for x86 TODO use device tree for ARM
+#ifdef CONFIG_X86
+    pdev_x86 = platform_device_register_simple("glandagpu", -1, 
+                                           glandagpu_resources, 
+                                           ARRAY_SIZE(glandagpu_resources));
+    if (IS_ERR(pdev_x86)) {
+        pr_err("GlandaGPU: Failed to register platform device\n");
+        platform_driver_unregister(&glandagpu_driver);
+        return PTR_ERR(pdev_x86);
+    }
+#endif
+
     pr_info("GlandaGPU: Module loaded successfully\n");
     return 0;
 }
 
 static void __exit glandagpu_exit(void)
 {
+#ifdef CONFIG_X86 // Device Registration only for x86 TODO use device tree for ARM
+    if (pdev_x86)
+        platform_device_unregister(pdev_x86);
+#endif
     platform_driver_unregister(&glandagpu_driver);
     pr_info("GlandaGPU: Module unloaded\n");
 }
