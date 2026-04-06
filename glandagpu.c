@@ -1,0 +1,468 @@
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/platform_device.h>
+#include <linux/io.h>
+#include <linux/delay.h>      // udelay (polling)
+#include <linux/mod_devicetable.h> // Device Tree parsing
+#include <linux/of.h>
+#include <linux/slab.h>  // GFP_KERNEL
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/uaccess.h>
+#include <linux/interrupt.h>
+#include <linux/wait.h>
+#include <linux/mm.h>
+#include "glanda_uapi.h"
+#include <linux/mutex.h>
+
+// Hardware Constants
+#define GLANDA_WIDTH      640
+#define GLANDA_HEIGHT     480
+#define GLANDA_VRAM_SIZE  (GLANDA_WIDTH * GLANDA_HEIGHT * 4)
+#define GLANDA_MMIO_SIZE  32
+#define GLANDA_MMIO_OFFSET 0x00200000
+
+// Base addresses (x86 testing)
+#define BRIDGE_BASE       0xC0000000
+#define GLANDA_VRAM_BASE  (BRIDGE_BASE + 0x00000000)
+#define GLANDA_MMIO_BASE  (BRIDGE_BASE + GLANDA_MMIO_OFFSET)
+#define GLANDA_BASE_SIZE  BRIDGE_BASE + 0x01000000 - 1
+
+// Register Offsets
+#define REG_STATUS  0x00
+#define REG_CTRL    0x04
+#define REG_COORD0  0x08
+#define REG_COORD1  0x0C
+#define REG_COLOR   0x10
+#define REG_ISR     0x14
+#define REG_IER     0x18
+
+// Bit Masks
+#define INT_DONE    (1 << 0)
+#define INT_VSYNC   (1 << 1)
+
+#define STATUS_BUSY (1 << 0)
+#define CMD_CLEAR   (0x1)
+#define CMD_RECT    (0x2)
+#define CMD_LINE    (0x3)
+#define CTRL_START  (1 << 4)
+
+static struct glanda_device *g_gdev = NULL;
+
+struct glanda_device {
+    void __iomem *mmio_base;    // Pointer (4 Byte)
+    void __iomem *vram_base;    // Pointer zuerst (4 Byte)
+    struct device *dev;         // Pointer (4 Byte)
+    phys_addr_t vram_phys;      // phys_addr_t kann 4 oder 8 Byte sein -> ans Ende!
+    
+    int irq;
+    wait_queue_head_t cmd_wq;
+    bool cmd_done;
+
+    dev_t cdev_num;
+    struct cdev cdev;
+    struct class *class;
+    struct mutex lock;
+};
+
+static irqreturn_t glanda_irq_handler(int irq, void *dev_id)
+{
+    struct glanda_device *gdev = dev_id;
+    if (!gdev || !gdev->mmio_base) {
+        return IRQ_NONE;
+    }
+    u32 isr = readl(gdev->mmio_base + REG_ISR);
+
+    if (!isr) {
+        return IRQ_NONE;
+    }
+
+    if (isr & INT_DONE) {
+        gdev->cmd_done = true;
+        wake_up_interruptible(&gdev->cmd_wq);
+    } // TODO Handle VSYNC interrupt
+
+    // Clear interrupt(W1C)
+    writel(isr, gdev->mmio_base + REG_ISR);
+
+    return IRQ_HANDLED;
+}
+
+// helper function to wait until hardware is idle
+static int glanda_wait_idle(struct glanda_device *gdev)
+{
+    int ret;
+    unsigned int status;
+
+    status = readl(gdev->mmio_base + REG_STATUS);
+    if (!(status & STATUS_BUSY)) {
+        return 0;
+    }
+
+    // polling
+    if (gdev->irq < 0) {
+        int timeout = 10000;
+
+        do {
+            status = readl(gdev->mmio_base + REG_STATUS);
+            if (!(status & STATUS_BUSY)) {
+                return 0;
+            }
+            udelay(1);
+        } while (--timeout > 0);
+
+        dev_err(gdev->dev, "GlandaGPU: glanda_wait_idle polled timeout\n");
+        return -ETIMEDOUT;
+    }
+
+    gdev->cmd_done = false;
+
+    ret = wait_event_interruptible_timeout(
+        gdev->cmd_wq,
+        gdev->cmd_done || !(readl(gdev->mmio_base + REG_STATUS) & STATUS_BUSY),
+        msecs_to_jiffies(500)); // 500ms timeout
+
+    if (ret == 0) {
+        dev_err(gdev->dev, "GlandaGPU: glanda_wait_idle IRQ timeout\n");
+        return -ETIMEDOUT;
+    } else if (ret < 0) {
+        return ret; // Interrupted by signal
+    }
+
+    return 0;
+}
+
+// Submit Rectangle Command
+static int glanda_hw_draw_rect(struct glanda_device *gdev, 
+                                int x, int y, int w, int h, int color)
+{
+    u32 coord0, coord1, ctrl;
+    int ret;
+
+    if (mutex_lock_interruptible(&gdev->lock)) {
+        return -ERESTARTSYS;
+    }
+
+    ret = glanda_wait_idle(gdev);
+    if (ret) {
+        mutex_unlock(&gdev->lock);
+        return ret;
+    }
+
+    //compact coordinates into 32-bit
+    coord0 = (y << 16) | (x & 0x3FF);
+    coord1 = (h << 16) | (w & 0x3FF);
+
+    writel(coord0, gdev->mmio_base + REG_COORD0);
+    writel(coord1, gdev->mmio_base + REG_COORD1);
+    writel(color,  gdev->mmio_base + REG_COLOR);
+
+    // start command
+    ctrl = CTRL_START | CMD_RECT;
+    writel(ctrl, gdev->mmio_base + REG_CTRL);
+    
+    dev_info(gdev->dev, "CMD Sent: Rect at %d,%d size %dx%d color 0x%x\n", x,y,w,h,color);
+
+    mutex_unlock(&gdev->lock);
+    return 0;
+}
+
+// Submit Line Command
+static int glanda_hw_draw_line(struct glanda_device *gdev, 
+                                int x1, int y1, int x2, int y2, int color)
+{
+    u32 coord0, coord1, ctrl;
+    int ret;
+
+    if (mutex_lock_interruptible(&gdev->lock)) {
+        return -ERESTARTSYS;
+    }
+
+    ret = glanda_wait_idle(gdev);
+    if (ret) {
+        mutex_unlock(&gdev->lock);
+        return ret;
+    }
+
+    //compact coordinates into 32-bit
+    coord0 = (y1 << 16) | (x1 & 0x3FF);
+    coord1 = (y2 << 16) | (x2 & 0x3FF);
+
+    writel(coord0, gdev->mmio_base + REG_COORD0);
+    writel(coord1, gdev->mmio_base + REG_COORD1);
+    writel(color,  gdev->mmio_base + REG_COLOR);
+
+    // start command
+    ctrl = CTRL_START | CMD_LINE;
+    writel(ctrl, gdev->mmio_base + REG_CTRL);
+    
+    dev_info(gdev->dev, "CMD Sent: Line from (%d,%d) to (%d,%d) color 0x%x\n", x1, y1, x2, y2, color);
+    mutex_unlock(&gdev->lock);
+    return 0;
+}
+
+// Submit Clear Screen Command
+static int glanda_hw_clear(struct glanda_device *gdev, int color)
+{
+    u32 ctrl;
+    int ret;
+
+    if (mutex_lock_interruptible(&gdev->lock)) {
+        return -ERESTARTSYS;
+    }
+
+    ret = glanda_wait_idle(gdev);
+    if (ret) {
+        mutex_unlock(&gdev->lock);
+        return ret;
+    }
+
+    writel(color, gdev->mmio_base + REG_COLOR);
+
+    // start command
+    ctrl = CTRL_START | CMD_CLEAR;
+    writel(ctrl, gdev->mmio_base + REG_CTRL);
+    
+    dev_info(gdev->dev, "CMD Sent: Clear Screen color 0x%x\n", color);
+    mutex_unlock(&gdev->lock);
+    return 0;
+}
+
+static long glanda_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    struct glanda_device *gdev = file->private_data;
+    struct glanda_draw_rect_cmd rect_cmd;
+    struct glanda_draw_line_cmd line_cmd;
+    struct glanda_clear_cmd clear_cmd;
+
+    switch (cmd) {
+    case GLANDA_IOC_CLEAR:
+        if (copy_from_user(&clear_cmd, (void __user *)arg, sizeof(clear_cmd))) {
+            return -EFAULT;
+        }
+        
+        return glanda_hw_clear(gdev, clear_cmd.color);
+        break;
+
+    case GLANDA_IOC_DRAW_RECT:
+        if (copy_from_user(&rect_cmd, (void __user *)arg, sizeof(rect_cmd))) {
+            return -EFAULT;
+        }
+
+        if (rect_cmd.x >= GLANDA_WIDTH || rect_cmd.y >= GLANDA_HEIGHT ||
+            rect_cmd.w > GLANDA_WIDTH || rect_cmd.h > GLANDA_HEIGHT ||
+            rect_cmd.x + rect_cmd.w > GLANDA_WIDTH ||
+            rect_cmd.y + rect_cmd.h > GLANDA_HEIGHT) {
+            return -EINVAL;
+        }
+
+        dev_info(gdev->dev, "IOCTL: Draw Rect %dx%d color %x\n", 
+                 rect_cmd.w, rect_cmd.h, rect_cmd.color);
+        
+        return glanda_hw_draw_rect(gdev, rect_cmd.x, rect_cmd.y, rect_cmd.w, rect_cmd.h, rect_cmd.color);
+        break;
+
+    case GLANDA_IOC_DRAW_LINE:
+        if (copy_from_user(&line_cmd, (void __user *)arg, sizeof(line_cmd))) {
+            return -EFAULT;
+        }
+
+        if (line_cmd.x0 >= GLANDA_WIDTH || line_cmd.y0 >= GLANDA_HEIGHT ||
+            line_cmd.x1 >= GLANDA_WIDTH || line_cmd.y1 >= GLANDA_HEIGHT) {
+            return -EINVAL;
+        }
+
+        dev_info(gdev->dev, "IOCTL: Draw Line (%d,%d)->(%d,%d) color %x\n", 
+                 line_cmd.x0, line_cmd.y0, line_cmd.x1, line_cmd.y1, line_cmd.color);
+        
+        return glanda_hw_draw_line(gdev, line_cmd.x0, line_cmd.y0, line_cmd.x1, line_cmd.y1, line_cmd.color);
+        break;
+
+    default:
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static int glanda_mmap(struct file *file, struct vm_area_struct *vma)
+{
+    struct glanda_device *gdev = file->private_data;
+    unsigned long size = vma->vm_end - vma->vm_start;
+
+    if (size > GLANDA_VRAM_SIZE)
+        return -EINVAL;
+
+    // Use non-cached for IO memory
+    vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+
+    if (remap_pfn_range(vma, vma->vm_start, 
+                        gdev->vram_phys >> PAGE_SHIFT, // Convert physical address to PFN (Page Frame Number)
+                        size, vma->vm_page_prot)) {
+        return -EAGAIN;
+    }
+    return 0;
+}
+
+static int glanda_open(struct inode *inode, struct file *file)
+{
+    // get device pointer
+    if (!g_gdev) return -ENODEV;
+    file->private_data = g_gdev; 
+    return 0;
+}
+
+static const struct file_operations glanda_fops = {
+    .owner          = THIS_MODULE,
+    .open           = glanda_open,
+    .mmap           = glanda_mmap,
+    .unlocked_ioctl = glanda_ioctl,
+};
+
+static int glandagpu_probe(struct platform_device *pdev)
+{
+    struct resource *res;
+    struct glanda_device *gdev;
+    int ret;
+
+    dev_info(&pdev->dev, "GlandaGPU Probe started\n");
+
+    // create device structure
+    gdev = devm_kzalloc(&pdev->dev, sizeof(*gdev), GFP_KERNEL);
+    if (!gdev) {
+        return -ENOMEM;
+    }
+    g_gdev = gdev; 
+    gdev->dev = &pdev->dev;
+    platform_set_drvdata(pdev, gdev);
+
+    mutex_init(&gdev->lock);
+
+    // Interrupt setup
+    init_waitqueue_head(&gdev->cmd_wq);
+    gdev->irq = -1;
+
+    // Map VRAM
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    if (!res) return -ENODEV;
+    gdev->vram_phys = res->start;
+    gdev->vram_base = devm_ioremap(&pdev->dev, res->start, GLANDA_VRAM_SIZE);
+    gdev->mmio_base = devm_ioremap(&pdev->dev, res->start + GLANDA_MMIO_OFFSET, GLANDA_MMIO_SIZE);
+    
+    if (!gdev->vram_base || !gdev->mmio_base) return -ENOMEM;
+
+    // 2. Hardware in einen sicheren Zustand bringen (Interrupts aus)
+    writel(0, gdev->mmio_base + REG_IER);
+    writel(0xFFFFFFFF, gdev->mmio_base + REG_ISR); // Alle alten Flags löschen
+
+    // 3. IRQ Nummer vom System abfragen
+    ret = platform_get_irq(pdev, 0);
+    if (ret > 0) {
+        gdev->irq = ret;
+        // 4. Handler registrieren (CPU ist jetzt bereit)
+        ret = devm_request_irq(&pdev->dev, gdev->irq, glanda_irq_handler,
+                               IRQF_SHARED, "glandagpu", gdev);
+        if (ret) {
+            dev_err(&pdev->dev, "Failed to request IRQ %d\n", gdev->irq);
+            return ret;
+        }
+        
+        // 5. ERST JETZT den Interrupt in der Hardware erlauben
+        writel(INT_DONE, gdev->mmio_base + REG_IER);
+        dev_info(&pdev->dev, "IRQ %d requested and enabled\n", gdev->irq);
+    } else {
+        dev_warn(&pdev->dev, "No IRQ found, falling back to polling\n");
+    }
+
+    // 6. Restliche Initialisierung (memset, char device...)
+    // memset_io(gdev->vram_base, 0, GLANDA_VRAM_SIZE); 
+
+    // Char Device
+    ret = alloc_chrdev_region(&gdev->cdev_num, 0, 1, "glandagpu");
+    if (ret < 0) {
+        dev_err(&pdev->dev, "Failed to alloc chrdev region\n");
+        return ret;
+    }
+
+    cdev_init(&gdev->cdev, &glanda_fops);
+    gdev->cdev.owner = THIS_MODULE;
+
+    ret = cdev_add(&gdev->cdev, gdev->cdev_num, 1);
+    if (ret < 0) {
+        unregister_chrdev_region(gdev->cdev_num, 1);
+        return ret;
+    }
+
+    // Create sysfs class and trigger udev to automatically create /dev/glandagpu
+    gdev->class = class_create(THIS_MODULE, "glanda_class");
+    if (IS_ERR(gdev->class)) {
+        cdev_del(&gdev->cdev);
+        unregister_chrdev_region(gdev->cdev_num, 1);
+        return PTR_ERR(gdev->class);
+    }
+    
+    device_create(gdev->class, NULL, gdev->cdev_num, NULL, "glandagpu");
+
+    dev_info(&pdev->dev, "GlandaGPU Initialized /dev/glandagpu created\n");
+    return 0;
+}
+
+static int glandagpu_remove(struct platform_device *pdev)
+{
+    struct glanda_device *gdev = platform_get_drvdata(pdev);
+
+    // Disable interrupts
+    writel(0, gdev->mmio_base + REG_IER);
+
+    // Clean up Char Device
+    device_destroy(gdev->class, gdev->cdev_num);
+    class_destroy(gdev->class);
+    cdev_del(&gdev->cdev);
+    unregister_chrdev_region(gdev->cdev_num, 1);
+
+    dev_info(&pdev->dev, "Driver removed\n");
+    return 0;
+}
+
+// Device Tree Match
+static const struct of_device_id glanda_of_match[] = {
+    { .compatible = "glanda,gpu-1.0", },
+    { /* sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, glanda_of_match);
+
+static struct platform_driver glandagpu_driver = {
+    .driver = {
+        .name = "glandagpu",
+        .of_match_table = glanda_of_match,
+    },
+    .probe = glandagpu_probe,
+    .remove = glandagpu_remove,
+};
+
+static int __init glandagpu_init(void)
+{
+    int ret;
+
+    ret = platform_driver_register(&glandagpu_driver);
+    if (ret) {
+        pr_err("GlandaGPU: Failed to register platform driver\n");
+        return ret;
+    }
+
+    pr_info("GlandaGPU: Module loaded successfully\n");
+    return 0;
+}
+
+static void __exit glandagpu_exit(void)
+{
+    platform_driver_unregister(&glandagpu_driver);
+    pr_info("GlandaGPU: Module unloaded\n");
+}
+
+module_init(glandagpu_init);
+module_exit(glandagpu_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Leander Kieweg <kieweg.leander@gmail.com>");
+MODULE_DESCRIPTION("GlandaGPU Hardware Accelerated Driver");
