@@ -7,7 +7,7 @@ obj-m += glandagpu.o
 ccflags-y := -march=armv7-a -marm -Wa,-march=armv7-a -fno-pic -fno-pie -Wno-error
 
 PWD := $(shell pwd)
-KDIR ?= $(abspath $(PWD)/../linux-socfpga)
+KDIR ?= $(abspath $(PWD)/../linux)
 CROSS := arm-linux-gnueabihf-
 
 all:

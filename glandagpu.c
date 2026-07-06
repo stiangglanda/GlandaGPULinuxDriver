@@ -394,7 +394,7 @@ static int glandagpu_probe(struct platform_device *pdev)
     }
 
     // Create sysfs class and trigger udev to automatically create /dev/glandagpu
-    gdev->class = class_create(THIS_MODULE, "glanda_class");
+    gdev->class = class_create("glanda_class");
     if (IS_ERR(gdev->class)) {
         cdev_del(&gdev->cdev);
         unregister_chrdev_region(gdev->cdev_num, 1);
@@ -407,7 +407,7 @@ static int glandagpu_probe(struct platform_device *pdev)
     return 0;
 }
 
-static int glandagpu_remove(struct platform_device *pdev)
+static void glandagpu_remove(struct platform_device *pdev)
 {
     struct glanda_device *gdev = platform_get_drvdata(pdev);
 
@@ -421,7 +421,6 @@ static int glandagpu_remove(struct platform_device *pdev)
     unregister_chrdev_region(gdev->cdev_num, 1);
 
     dev_info(&pdev->dev, "Driver removed\n");
-    return 0;
 }
 
 // Device Tree Match
