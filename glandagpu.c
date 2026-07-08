@@ -23,6 +23,16 @@
 #include <drm/drm_ioctl.h>
 #include <drm/drm_gem_shmem_helper.h>
 
+#include <drm/drm_connector.h>
+#include <drm/drm_encoder.h>
+#include <drm/drm_modeset_helper.h>
+#include <drm/drm_probe_helper.h>
+#include <drm/drm_simple_kms_helper.h>
+#include <drm/drm_gem_framebuffer_helper.h>
+#include <drm/drm_crtc.h>
+#include <drm/drm_crtc_helper.h>
+#include <drm/drm_modeset_helper_vtables.h>
+
 // Hardware Constants
 #define GLANDA_WIDTH      640
 #define GLANDA_HEIGHT     480
@@ -55,23 +65,88 @@
 #define CMD_LINE    (0x3)
 #define CTRL_START  (1 << 4)
 
-//static struct glanda_device *g_gdev = NULL;
-
 struct glanda_device {
     struct drm_device drm;
-    void __iomem *mmio_base;    // Pointer (4 Byte)
-    void __iomem *vram_base;    // Pointer zuerst (4 Byte)
-    struct device *dev;         // Pointer (4 Byte)
-    phys_addr_t vram_phys;      // phys_addr_t kann 4 oder 8 Byte sein -> ans Ende!
+    void __iomem *mmio_base;    
+    void __iomem *vram_base;    
+    struct device *dev;         
+    phys_addr_t vram_phys;      
     
     int irq;
     wait_queue_head_t cmd_wq;
     bool cmd_done;
 
     struct mutex lock;
+
+    struct drm_crtc crtc;
+    struct drm_encoder encoder;
+    struct drm_connector connector;
 };
 
 #define to_glanda(dev) container_of(dev, struct glanda_device, drm)
+
+static int glanda_connector_get_modes(struct drm_connector *connector)
+{
+    struct drm_display_mode *mode;
+
+    pr_info("GlandaGPU-Debug: glanda_connector_get_modes() wurde aufgerufen!\n");
+
+    mode = drm_mode_create(connector->dev);
+    if (!mode) {
+        pr_info("GlandaGPU-Debug: Fehler beim Erstellen des Modus-Objekts!\n");
+        return 0;
+    }
+
+    // VGA-Standard 640x480 @ 60 Hz
+    mode->hdisplay = 640;
+    mode->hsync_start = 656;
+    mode->hsync_end = 752;
+    mode->htotal = 800;
+
+    mode->vdisplay = 480;
+    mode->vsync_start = 490;
+    mode->vsync_end = 492;
+    mode->vtotal = 525;
+
+    mode->clock = 25175; // 25.175 MHz Pixelclock
+
+    mode->flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC;
+    mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
+
+    drm_mode_set_name(mode);
+    drm_mode_probed_add(connector, mode);
+
+    pr_info("GlandaGPU-Debug: Modus 640x480 erfolgreich hinzugefügt.\n");
+    return 1;
+}
+
+static enum drm_connector_status glanda_connector_detect(struct drm_connector *connector, bool force)
+{
+    pr_info("GlandaGPU-Debug: glanda_connector_detect() aufgerufen! force=%d\n", force);
+    return connector_status_connected;
+}
+
+static const struct drm_crtc_funcs glanda_crtc_funcs = {
+    .destroy = drm_crtc_cleanup,
+    .set_config = drm_crtc_helper_set_config, 
+};
+
+static const struct drm_crtc_helper_funcs glanda_crtc_helper_funcs = {
+};
+
+static const struct drm_connector_helper_funcs glanda_connector_helper_funcs = {
+    .get_modes = glanda_connector_get_modes,
+};
+
+static const struct drm_connector_funcs glanda_connector_funcs = {
+    .fill_modes = drm_helper_probe_single_connector_modes,
+    .destroy = drm_connector_cleanup,
+    .detect = glanda_connector_detect,
+};
+
+static const struct drm_mode_config_funcs glanda_mode_config_funcs = {
+    .fb_create = drm_gem_fb_create, 
+};
 
 static const struct file_operations glanda_drm_fops = {
     .owner          = THIS_MODULE,
@@ -86,7 +161,7 @@ static const struct file_operations glanda_drm_fops = {
 };
 
 static const struct drm_driver glanda_drm_driver = {
-    .driver_features    = DRIVER_GEM,
+    .driver_features    = DRIVER_GEM | DRIVER_MODESET,
     .name               = "glandagpu",
     .desc               = "GlandaGPU Hardware Accelerated DRM Driver",
     .major              = 1,
@@ -110,156 +185,12 @@ static irqreturn_t glanda_irq_handler(int irq, void *dev_id)
     if (isr & INT_DONE) {
         gdev->cmd_done = true;
         wake_up_interruptible(&gdev->cmd_wq);
-    } // TODO Handle VSYNC interrupt
+    } 
 
     // Clear interrupt(W1C)
     writel(isr, gdev->mmio_base + REG_ISR);
-
     return IRQ_HANDLED;
 }
-
-/*
-
-// helper function to wait until hardware is idle
-static int glanda_wait_idle(struct glanda_device *gdev)
-{
-    int ret;
-    unsigned int status;
-
-    status = readl(gdev->mmio_base + REG_STATUS);
-    if (!(status & STATUS_BUSY)) {
-        return 0;
-    }
-
-    // polling
-    if (gdev->irq < 0) {
-        int timeout = 10000;
-
-        do {
-            status = readl(gdev->mmio_base + REG_STATUS);
-            if (!(status & STATUS_BUSY)) {
-                return 0;
-            }
-            udelay(1);
-        } while (--timeout > 0);
-
-        dev_err(gdev->dev, "GlandaGPU: glanda_wait_idle polled timeout\n");
-        return -ETIMEDOUT;
-    }
-
-    gdev->cmd_done = false;
-
-    ret = wait_event_interruptible_timeout(
-        gdev->cmd_wq,
-        gdev->cmd_done || !(readl(gdev->mmio_base + REG_STATUS) & STATUS_BUSY),
-        msecs_to_jiffies(500)); // 500ms timeout
-
-    if (ret == 0) {
-        dev_err(gdev->dev, "GlandaGPU: glanda_wait_idle IRQ timeout\n");
-        return -ETIMEDOUT;
-    } else if (ret < 0) {
-        return ret; // Interrupted by signal
-    }
-
-    return 0;
-}
-
-// Submit Rectangle Command
-static int glanda_hw_draw_rect(struct glanda_device *gdev, 
-                                int x, int y, int w, int h, int color)
-{
-    u32 coord0, coord1, ctrl;
-    int ret;
-
-    if (mutex_lock_interruptible(&gdev->lock)) {
-        return -ERESTARTSYS;
-    }
-
-    ret = glanda_wait_idle(gdev);
-    if (ret) {
-        mutex_unlock(&gdev->lock);
-        return ret;
-    }
-
-    //compact coordinates into 32-bit
-    coord0 = (y << 16) | (x & 0x3FF);
-    coord1 = (h << 16) | (w & 0x3FF);
-
-    writel(coord0, gdev->mmio_base + REG_COORD0);
-    writel(coord1, gdev->mmio_base + REG_COORD1);
-    writel(color,  gdev->mmio_base + REG_COLOR);
-
-    // start command
-    ctrl = CTRL_START | CMD_RECT;
-    writel(ctrl, gdev->mmio_base + REG_CTRL);
-    
-    dev_info(gdev->dev, "CMD Sent: Rect at %d,%d size %dx%d color 0x%x\n", x,y,w,h,color);
-
-    mutex_unlock(&gdev->lock);
-    return 0;
-}
-
-// Submit Line Command
-static int glanda_hw_draw_line(struct glanda_device *gdev, 
-                                int x1, int y1, int x2, int y2, int color)
-{
-    u32 coord0, coord1, ctrl;
-    int ret;
-
-    if (mutex_lock_interruptible(&gdev->lock)) {
-        return -ERESTARTSYS;
-    }
-
-    ret = glanda_wait_idle(gdev);
-    if (ret) {
-        mutex_unlock(&gdev->lock);
-        return ret;
-    }
-
-    //compact coordinates into 32-bit
-    coord0 = (y1 << 16) | (x1 & 0x3FF);
-    coord1 = (y2 << 16) | (x2 & 0x3FF);
-
-    writel(coord0, gdev->mmio_base + REG_COORD0);
-    writel(coord1, gdev->mmio_base + REG_COORD1);
-    writel(color,  gdev->mmio_base + REG_COLOR);
-
-    // start command
-    ctrl = CTRL_START | CMD_LINE;
-    writel(ctrl, gdev->mmio_base + REG_CTRL);
-    
-    dev_info(gdev->dev, "CMD Sent: Line from (%d,%d) to (%d,%d) color 0x%x\n", x1, y1, x2, y2, color);
-    mutex_unlock(&gdev->lock);
-    return 0;
-}
-
-// Submit Clear Screen Command
-static int glanda_hw_clear(struct glanda_device *gdev, int color)
-{
-    u32 ctrl;
-    int ret;
-
-    if (mutex_lock_interruptible(&gdev->lock)) {
-        return -ERESTARTSYS;
-    }
-
-    ret = glanda_wait_idle(gdev);
-    if (ret) {
-        mutex_unlock(&gdev->lock);
-        return ret;
-    }
-
-    writel(color, gdev->mmio_base + REG_COLOR);
-
-    // start command
-    ctrl = CTRL_START | CMD_CLEAR;
-    writel(ctrl, gdev->mmio_base + REG_CTRL);
-    
-    dev_info(gdev->dev, "CMD Sent: Clear Screen color 0x%x\n", color);
-    mutex_unlock(&gdev->lock);
-    return 0;
-}
-*/
 
 static int glandagpu_probe(struct platform_device *pdev)
 {
@@ -278,11 +209,9 @@ static int glandagpu_probe(struct platform_device *pdev)
     platform_set_drvdata(pdev, gdev);
 
     mutex_init(&gdev->lock);
-
     // Interrupt setup
     init_waitqueue_head(&gdev->cmd_wq);
     gdev->irq = -1;
-
     // Map VRAM
     res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
     if (!res) return -ENODEV;
@@ -293,7 +222,7 @@ static int glandagpu_probe(struct platform_device *pdev)
     if (!gdev->vram_base || !gdev->mmio_base) return -ENOMEM;
 
     writel(0, gdev->mmio_base + REG_IER);
-    writel(0xFFFFFFFF, gdev->mmio_base + REG_ISR); // Alle alten Flags löschen
+    writel(0xFFFFFFFF, gdev->mmio_base + REG_ISR); //clear flags
 
     ret = platform_get_irq(pdev, 0);
     if (ret > 0) {
@@ -311,14 +240,51 @@ static int glandagpu_probe(struct platform_device *pdev)
         dev_warn(&pdev->dev, "No IRQ found, falling back to polling\n");
     }
 
-    ret = drm_dev_register(&gdev->drm, 0);
+    // DRM mode config
+    drm_mode_config_init(&gdev->drm);
+    gdev->drm.mode_config.min_width = 640;
+    gdev->drm.mode_config.min_height = 480;
+    gdev->drm.mode_config.max_width = 640;
+    gdev->drm.mode_config.max_height = 480;
+    gdev->drm.mode_config.funcs = &glanda_mode_config_funcs;
+
+    // CRTC init
+    ret = drm_crtc_init(&gdev->drm, &gdev->crtc, &glanda_crtc_funcs);
     if (ret) {
-        dev_err(&pdev->dev, "Failed to register DRM device\n");
-        return ret;
+        dev_err(&pdev->dev, "Failed to initialize CRTC\n");
+        goto err_mode_cleanup;
     }
+    drm_crtc_helper_add(&gdev->crtc, &glanda_crtc_helper_funcs);
+
+    // Encoder init
+    ret = drm_simple_encoder_init(&gdev->drm, &gdev->encoder, DRM_MODE_ENCODER_DAC);
+    if (ret) {
+        dev_err(&pdev->dev, "Failed to initialize encoder\n");
+        goto err_mode_cleanup;
+    }
+    gdev->encoder.possible_crtcs = 1; 
+
+    // Connector init
+    ret = drm_connector_init(&gdev->drm, &gdev->connector, &glanda_connector_funcs, DRM_MODE_CONNECTOR_VGA);
+    if (ret) {
+        dev_err(&pdev->dev, "Failed to initialize connector\n");
+        goto err_mode_cleanup;
+    }
+    drm_connector_helper_add(&gdev->connector, &glanda_connector_helper_funcs);
+
+    drm_connector_attach_encoder(&gdev->connector, &gdev->encoder);
+
+    drm_helper_probe_single_connector_modes(&gdev->connector, 1024, 768);
+
+    ret = drm_dev_register(&gdev->drm, 0);
+    if (ret) goto err_mode_cleanup;
 
     dev_info(&pdev->dev, "GlandaGPU DRM Initialized (/dev/dri/cardX created)\n");
     return 0;
+
+err_mode_cleanup:
+    drm_mode_config_cleanup(&gdev->drm);
+    return ret;
 }
 
 static void glandagpu_remove(struct platform_device *pdev)
@@ -326,14 +292,11 @@ static void glandagpu_remove(struct platform_device *pdev)
     struct glanda_device *gdev = platform_get_drvdata(pdev);
 
     drm_dev_unregister(&gdev->drm);
-
+    drm_mode_config_cleanup(&gdev->drm);
     // Disable interrupts
     writel(0, gdev->mmio_base + REG_IER);
-
     dev_info(&pdev->dev, "GlandaGPU DRM Driver removed\n");
-    
 }
-
 // Device Tree Match
 static const struct of_device_id glanda_of_match[] = {
     { .compatible = "glanda,gpu-1.0", },
@@ -349,7 +312,6 @@ static struct platform_driver glandagpu_driver = {
     .probe = glandagpu_probe,
     .remove = glandagpu_remove,
 };
-
 // Device Registration only for x86 TODO use device tree for ARM
 #ifdef CONFIG_X86
 static struct platform_device *pdev_x86;
@@ -377,7 +339,6 @@ static int __init glandagpu_init(void)
         pr_err("GlandaGPU: Failed to register platform driver\n");
         return ret;
     }
-
     // Device Registration only for x86 TODO use device tree for ARM
 #ifdef CONFIG_X86
     pdev_x86 = platform_device_register_simple("glandagpu", -1, 
