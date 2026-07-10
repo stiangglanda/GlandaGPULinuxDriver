@@ -288,17 +288,17 @@ static void glanda_plane_atomic_update(struct drm_plane *plane,
 
     {
         uint32_t *src = (uint32_t *)map.vaddr;
-        uint16_t __iomem *dst = (uint16_t __iomem *)gdev->vram_base;
+        uint32_t __iomem *dst = (uint32_t __iomem *)gdev->vram_base;
         int i;
 
         for (i = 0; i < GLANDA_WIDTH * GLANDA_HEIGHT; i++) {
             uint32_t pixel = src[i];
 
-            uint16_t packed = ((pixel >> 12) & 0x0F00) | // red
+            uint32_t packed = ((pixel >> 12) & 0x0F00) | // red
                               ((pixel >> 8)  & 0x00F0) | // green
                               ((pixel >> 4)  & 0x000F);  // blue
 
-            writew(packed, &dst[i]);
+            writel(packed, &dst[i]);
         }
     }
 
