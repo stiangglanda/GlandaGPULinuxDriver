@@ -41,8 +41,9 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_damage_helper.h>
+#include <drm/drm_print.h>
 
-#include "glanda_drm.h"
+#include <uapi/drm/glanda_drm.h>
 
 /* Hardware Constants */
 #define GLANDA_WIDTH      640
@@ -283,7 +284,7 @@ static int glanda_drm_ioctl_draw_line(struct drm_device *dev, void *data,
 }
 
 static void glanda_plane_atomic_update(struct drm_plane *plane,
-				       struct drm_atomic_state *state)
+				       struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
 	struct drm_framebuffer *fb = new_state->fb;
@@ -304,8 +305,10 @@ static void glanda_plane_atomic_update(struct drm_plane *plane,
 		return;
 	}
 
-	ret = drm_gem_shmem_vmap(shmem, &map);
+	dma_resv_lock(shmem->base.resv, NULL);
+	ret = drm_gem_shmem_vmap_locked(shmem, &map);
 	if (ret) {
+		dma_resv_unlock(shmem->base.resv);
 		drm_err(&gdev->drm,
 			"GlandaGPU: failed to vmap GEM shmem object\n");
 		return;
@@ -317,7 +320,8 @@ static void glanda_plane_atomic_update(struct drm_plane *plane,
 	if (ret) {
 		drm_err(&gdev->drm, "GlandaGPU: timed out waiting for idle\n");
 		mutex_unlock(&gdev->lock);
-		drm_gem_shmem_vunmap(shmem, &map);
+		drm_gem_shmem_vunmap_locked(shmem, &map);
+	dma_resv_unlock(shmem->base.resv);
 		return;
 	}
 
@@ -345,11 +349,12 @@ static void glanda_plane_atomic_update(struct drm_plane *plane,
 	}
 
 	mutex_unlock(&gdev->lock);
-	drm_gem_shmem_vunmap(shmem, &map);
+	drm_gem_shmem_vunmap_locked(shmem, &map);
+	dma_resv_unlock(shmem->base.resv);
 }
 
 static int glanda_plane_atomic_check(struct drm_plane *plane,
-				     struct drm_atomic_state *state)
+				     struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state, plane);
 	struct drm_crtc_state *crtc_state;
@@ -437,19 +442,19 @@ static void glanda_crtc_disable_vblank(struct drm_crtc *crtc)
 }
 
 static void glanda_crtc_atomic_enable(struct drm_crtc *crtc,
-				      struct drm_atomic_state *state)
+				      struct drm_atomic_commit *state)
 {
 	drm_crtc_vblank_on(crtc);
 }
 
 static void glanda_crtc_atomic_disable(struct drm_crtc *crtc,
-				       struct drm_atomic_state *state)
+				       struct drm_atomic_commit *state)
 {
 	drm_crtc_vblank_off(crtc);
 }
 
 static void glanda_crtc_atomic_flush(struct drm_crtc *crtc,
-				     struct drm_atomic_state *state)
+				     struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *new_state = drm_atomic_get_new_crtc_state(state, crtc);
 	struct drm_pending_vblank_event *event;
@@ -508,10 +513,10 @@ static const struct drm_framebuffer_funcs glanda_fb_funcs = {
 
 static struct drm_framebuffer *glanda_fb_create(struct drm_device *dev,
 						struct drm_file *file,
-						const struct drm_mode_fb_cmd2
-						*mode_cmd)
+						const struct drm_format_info *info,
+						const struct drm_mode_fb_cmd2 *mode_cmd)
 {
-	return drm_gem_fb_create_with_funcs(dev, file, mode_cmd, &glanda_fb_funcs);
+	return drm_gem_fb_create_with_funcs(dev, file, info, mode_cmd, &glanda_fb_funcs);
 }
 
 static const struct drm_mode_config_funcs glanda_mode_config_funcs = {
