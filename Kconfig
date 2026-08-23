@@ -1,7 +1,6 @@
 config DRM_GLANDA
 	tristate "GlandaGPU DRM driver"
 	depends on DRM && MMU && (PCI || COMPILE_TEST)
-	depends on DRM
 	select DRM_KMS_HELPER
 	select DRM_GEM_SHMEM_HELPER
 	help
