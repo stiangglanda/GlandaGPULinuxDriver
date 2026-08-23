@@ -1,6 +1,11 @@
 config DRM_GLANDA
-    bool "GlandaGPU DRM Support"
-    depends on DRM
-    default y
-    help
-      Choose this option to enable the GlandaGPU driver
+	tristate "GlandaGPU DRM driver"
+	depends on DRM && MMU && (PCI || COMPILE_TEST)
+	depends on DRM
+	select DRM_KMS_HELPER
+	select DRM_GEM_SHMEM_HELPER
+	help
+	  DRM/KMS driver for the GlandaGPU display controller
+	  (FPGA soft IP). This driver supports basic modesetting,
+	  dumb buffers, and atomic updates via shadow planes.
+	  It also provides PCI probing for QEMU testing.
