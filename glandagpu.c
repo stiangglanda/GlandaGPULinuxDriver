@@ -86,48 +86,89 @@ struct glanda_device {
 	struct drm_connector connector;
 };
 
-#define to_glanda(dev) container_of(dev, struct glanda_device, drm)
+#define to_glanda(dev) container_of_const(dev, struct glanda_device, drm)
 
 static const u32 glanda_plane_formats[] = {
 	DRM_FORMAT_XRGB8888,
 };
 
-static void glanda_plane_atomic_update(struct drm_plane *plane,
-				       struct drm_atomic_state *state)
+static void glanda_blit_rect(struct glanda_device *gdev,
+	const struct drm_rect *dst_clip,
+	const struct iosys_map *src,
+	struct drm_framebuffer *fb,
+	const struct drm_rect *src_clip)
 {
-	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
-	struct drm_shadow_plane_state *shadow_state = to_drm_shadow_plane_state(new_state);
-	struct drm_framebuffer *fb = new_state->fb;
-	struct glanda_device *gdev = to_glanda(plane->dev);
-	u32 src_pitch, width, height, x, y;
-	int idx;
-
-	if (!fb)
-		return;
-
-	if (!drm_dev_enter(plane->dev, &idx))
-		return;
-
-	src_pitch = fb->pitches[0];
-	width = min_t(u32, fb->width, GLANDA_WIDTH);
-	height = min_t(u32, fb->height, GLANDA_HEIGHT);
+	unsigned int src_pitch = fb->pitches[0];
+	unsigned int width = min(drm_rect_width(src_clip), drm_rect_width(dst_clip));
+	unsigned int height = min(drm_rect_height(src_clip), drm_rect_height(dst_clip));
+	unsigned int x, y;
 
 	for (y = 0; y < height; y++) {
-		size_t offset = y * GLANDA_WIDTH * sizeof(u32);
-		u32 __iomem *dst = (u32 __iomem *)(gdev->vram_base + offset);
+		u32 __iomem *dst = (u32 __iomem *)gdev->vram_base +
+			(size_t)(dst_clip->y1 + y) * GLANDA_WIDTH + dst_clip->x1;
 
-		for (x = 0; x < width; x++) {
-			u32 pixel = iosys_map_rd(&shadow_state->data[0],
-						 y * src_pitch + x * sizeof(u32), u32);
+		size_t src_off = (size_t)(src_clip->y1 + y) * src_pitch +
+			src_clip->x1 * sizeof(u32);
+  
+		for (x = 0; x < width; x++) {  
+			u32 pixel = iosys_map_rd(src, src_off + x * sizeof(u32), u32);
+			u32 packed;
+
 			pixel = le32_to_cpu((__force __le32)pixel);
-			u32 packed = ((pixel >> 12) & 0x0F00) |
-				((pixel >> 8) & 0x00F0) |
-				((pixel >> 4) & 0x000F);
+			packed = ((pixel >> 12) & 0x0F00) |
+			((pixel >> 8) & 0x00F0) |
+			((pixel >> 4) & 0x000F);
 
 			writel_relaxed(packed, &dst[x]);
 		}
 	}
+}
 
+static void glanda_plane_atomic_update(struct drm_plane *plane,
+				       struct drm_atomic_state *state)
+{
+	struct drm_plane_state *old_state = drm_atomic_get_old_plane_state(state, plane);
+	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_shadow_plane_state *shadow_state = to_drm_shadow_plane_state(new_state);
+	struct drm_framebuffer *fb = new_state->fb;
+	struct glanda_device *gdev = to_glanda(plane->dev);
+	struct drm_atomic_helper_damage_iter iter;
+	struct drm_rect damage;
+	int ret, idx;
+
+	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
+	if (ret)
+		return;
+
+	if (!drm_dev_enter(plane->dev, &idx))
+		goto out_drm_gem_fb_end_cpu_access;
+
+	drm_atomic_helper_damage_iter_init(&iter, old_state, new_state);
+	drm_atomic_for_each_plane_damage(&iter, &damage) {
+		struct drm_rect dst_clip = new_state->dst;
+
+		if (!drm_rect_intersect(&dst_clip, &damage))
+			continue;
+
+		glanda_blit_rect(gdev, &dst_clip, &shadow_state->data[0], fb, &damage);
+	}
+
+	drm_dev_exit(idx);
+out_drm_gem_fb_end_cpu_access:
+	drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
+}
+
+static void glanda_plane_atomic_disable(struct drm_plane *plane,
+						struct drm_atomic_state *state)
+{
+	struct drm_device *dev = plane->dev;
+	struct glanda_device *gdev = to_glanda(dev);
+	int idx;
+
+	if (!drm_dev_enter(dev, &idx))
+		return;
+
+	memset_io(gdev->vram_base, 0, GLANDA_WIDTH * sizeof(u32) * GLANDA_HEIGHT);
 	drm_dev_exit(idx);
 }
 
@@ -135,23 +176,31 @@ static int glanda_plane_atomic_check(struct drm_plane *plane,
 				     struct drm_atomic_state *state)
 {
 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state, plane);
-	struct drm_crtc_state *crtc_state;
+	struct drm_crtc_state *new_crtc_state = NULL;
+	int ret;
 
-	if (!new_plane_state->crtc)
-		return 0;
+	if (new_plane_state->crtc)
+		new_crtc_state = drm_atomic_get_new_crtc_state(state, new_plane_state->crtc);
 
-	crtc_state = drm_atomic_get_new_crtc_state(state, new_plane_state->crtc);
-
-	return drm_atomic_helper_check_plane_state(new_plane_state, crtc_state,
+	ret = drm_atomic_helper_check_plane_state(new_plane_state, new_crtc_state,
 		DRM_PLANE_NO_SCALING, DRM_PLANE_NO_SCALING,
 		false,	/* can_position */
-		false	/* can_update_disabled */);
+		false); /* can_update_disabled */
+	if (ret)
+		return ret;
+
+	/* VRAM only holds GLANDA_WIDTH x GLANDA_HEIGHT, nothing to pan into. */
+	if (new_plane_state->src.x1 || new_plane_state->src.y1)
+		return -EINVAL;
+
+	return 0;
 }
 
 static const struct drm_plane_helper_funcs glanda_plane_helper_funcs = {
 	DRM_GEM_SHADOW_PLANE_HELPER_FUNCS,
 	.atomic_update = glanda_plane_atomic_update,
 	.atomic_check = glanda_plane_atomic_check,
+	.atomic_disable = glanda_plane_atomic_disable,
 };
 
 static const struct drm_plane_funcs glanda_plane_funcs = {
@@ -193,29 +242,38 @@ static int glanda_connector_get_modes(struct drm_connector *connector)
 	return 1;
 }
 
-static enum drm_connector_status glanda_connector_detect(struct drm_connector
-							 *connector, bool force)
-{
-	return connector_status_connected;
-}
-
 static int glanda_crtc_enable_vblank(struct drm_crtc *crtc)
 {
 	struct glanda_device *gdev = to_glanda(crtc->dev);
 	u32 ier;
+	int idx;
+
+	if (gdev->irq <= 0)
+		return -EINVAL;
+
+	if (!drm_dev_enter(crtc->dev, &idx))
+		return -ENODEV;
 
 	ier = readl(gdev->mmio_base + REG_IER);
 	writel(ier | INT_VSYNC, gdev->mmio_base + REG_IER);
 
+	drm_dev_exit(idx);
 	return 0;
 }
 
 static void glanda_crtc_disable_vblank(struct drm_crtc *crtc)
 {
 	struct glanda_device *gdev = to_glanda(crtc->dev);
-	u32 ier = readl(gdev->mmio_base + REG_IER);
+	u32 ier;
+	int idx;
 
+	if (!drm_dev_enter(crtc->dev, &idx))
+		return;
+
+	ier = readl(gdev->mmio_base + REG_IER);
 	writel(ier & ~INT_VSYNC, gdev->mmio_base + REG_IER);
+
+	drm_dev_exit(idx);
 }
 
 static void glanda_crtc_atomic_enable(struct drm_crtc *crtc,
@@ -280,7 +338,6 @@ static const struct drm_encoder_funcs glanda_encoder_funcs = {
 static const struct drm_connector_funcs glanda_connector_funcs = {
 	.fill_modes = drm_helper_probe_single_connector_modes,
 	.destroy = drm_connector_cleanup,
-	.detect = glanda_connector_detect,
 	.reset = drm_atomic_helper_connector_reset,
 	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
@@ -298,7 +355,7 @@ static const struct drm_driver glanda_drm_driver = {
 	.driver_features =
 	    DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
 	.name = "glandagpu",
-	.desc = "GlandaGPU Hardware Accelerated DRM Driver",
+	.desc = "GlandaGPU DRM Driver",
 	.major = 1,
 	.minor = 0,
 	.fops = &glanda_drm_fops,
@@ -338,14 +395,14 @@ static int glanda_drm_init(struct glanda_device *gdev, int irq)
 	writel(0xFFFFFFFF, gdev->mmio_base + REG_ISR);	/* clear flags */
 
 	/* DRM mode config */
-	ret = drm_mode_config_init(&gdev->drm);
+	ret = drmm_mode_config_init(&gdev->drm);
 	if (ret)
 		return ret;
 
 	gdev->drm.mode_config.min_width = 640;
 	gdev->drm.mode_config.min_height = 480;
-	gdev->drm.mode_config.max_width = 640;
-	gdev->drm.mode_config.max_height = 480;
+	gdev->drm.mode_config.max_width = DRM_SHADOW_PLANE_MAX_WIDTH;
+	gdev->drm.mode_config.max_height = DRM_SHADOW_PLANE_MAX_HEIGHT;
 	gdev->drm.mode_config.funcs = &glanda_mode_config_funcs;
 
 	ret = drm_universal_plane_init(&gdev->drm, &gdev->primary_plane, 1 << 0,
@@ -359,12 +416,7 @@ static int glanda_drm_init(struct glanda_device *gdev, int irq)
 	}
 	drm_plane_helper_add(&gdev->primary_plane, &glanda_plane_helper_funcs);
 
-	/* VBlank init */
-	ret = drm_vblank_init(&gdev->drm, 1);
-	if (ret) {
-		drm_err(&gdev->drm, "Failed to initialize vblank\n");
-		return ret;
-	}
+	drm_plane_enable_fb_damage_clips(&gdev->primary_plane);
 
 	/* CRTC init */
 	ret = drm_crtc_init_with_planes(&gdev->drm, &gdev->crtc,
@@ -394,10 +446,12 @@ static int glanda_drm_init(struct glanda_device *gdev, int irq)
 
 	drm_connector_attach_encoder(&gdev->connector, &gdev->encoder);
 
-	/* Populate connector state early so userspace can enumerate modes. */
-	mutex_lock(&gdev->drm.mode_config.mutex);
-	drm_helper_probe_single_connector_modes(&gdev->connector, 1024, 768);
-	mutex_unlock(&gdev->drm.mode_config.mutex);
+	/* VBlank init */
+	ret = drm_vblank_init(&gdev->drm, 1);
+	if (ret) {
+		drm_err(&gdev->drm, "Failed to initialize vblank\n");
+		return ret;
+	}
 
 	drm_mode_config_reset(&gdev->drm);
 
@@ -410,17 +464,13 @@ static int glanda_drm_init(struct glanda_device *gdev, int irq)
 				gdev->irq);
 			return ret;
 		}
-
-		writel(INT_VSYNC, gdev->mmio_base + REG_IER);
 	} else {
 		drm_warn(&gdev->drm, "No IRQ found, falling back to polling\n");
 	}
 
 	ret = drm_dev_register(&gdev->drm, 0);
-	if (ret) {
-		writel(0, gdev->mmio_base + REG_IER);
+	if (ret)
 		return ret;
-	}
 
 	return 0;
 }
@@ -429,10 +479,6 @@ static int glanda_drm_init(struct glanda_device *gdev, int irq)
 static void glanda_drm_fini(struct glanda_device *gdev)
 {
 	drm_dev_unplug(&gdev->drm);
-	drm_atomic_helper_shutdown(&gdev->drm);
-
-	/* Disable interrupts */
-	writel(0, gdev->mmio_base + REG_IER);
 }
 
 static int glandagpu_probe(struct platform_device *pdev)
@@ -459,7 +505,7 @@ static int glandagpu_probe(struct platform_device *pdev)
 	}
 
 	gdev->vram_phys = res->start;
-	gdev->vram_base = devm_ioremap(&pdev->dev, res->start, GLANDA_VRAM_SIZE);
+	gdev->vram_base = devm_ioremap_wc(&pdev->dev, res->start, GLANDA_VRAM_SIZE);
 	gdev->mmio_base = devm_ioremap(&pdev->dev, res->start + GLANDA_MMIO_OFFSET,
 					   GLANDA_MMIO_SIZE);
 	if (!gdev->vram_base || !gdev->mmio_base) {
@@ -499,6 +545,7 @@ static struct platform_driver glandagpu_driver = {
 };
 
 /* PCI probe path for the QEMU test device, real hardware uses platform_driver */
+#ifdef CONFIG_PCI
 static int glandagpu_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct glanda_device *gdev;
@@ -552,6 +599,7 @@ static struct pci_driver glandagpu_pci_driver = {
 	.probe = glandagpu_pci_probe,
 	.remove = glandagpu_pci_remove,
 };
+#endif /* CONFIG_PCI */
 
 static int __init glandagpu_init(void)
 {
@@ -563,18 +611,23 @@ static int __init glandagpu_init(void)
 		return ret;
 	}
 
+#ifdef CONFIG_PCI
 	ret = pci_register_driver(&glandagpu_pci_driver);
 	if (ret) {
 		pr_err("GlandaGPU: Failed to register PCI driver\n");
 		platform_driver_unregister(&glandagpu_driver);
 		return ret;
 	}
+#endif
+
 	return 0;
 }
 
 static void __exit glandagpu_exit(void)
 {
+#ifdef CONFIG_PCI
 	pci_unregister_driver(&glandagpu_pci_driver);
+#endif
 	platform_driver_unregister(&glandagpu_driver);
 }
 
