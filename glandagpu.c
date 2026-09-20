@@ -6,7 +6,6 @@
 #include <linux/platform_device.h>
 #include <linux/pci.h>
 #include <linux/io.h>
-#include <linux/delay.h>	/* udelay (polling) */
 #include <linux/of.h>
 #include <linux/slab.h>		/* GFP_KERNEL */
 #include <linux/interrupt.h>
@@ -24,6 +23,7 @@
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_vblank.h>
+#include <drm/drm_vblank_helper.h>
 
 #include <drm/drm_connector.h>
 #include <drm/drm_encoder.h>
@@ -96,12 +96,19 @@ static void glanda_blit_rect(struct glanda_device *gdev,
 			     const struct drm_rect *dst_clip,
 			     const struct iosys_map *src,
 			     struct drm_framebuffer *fb,
-			     int dst_off_x, int dst_off_y)
+			     int dst_off_x, int dst_off_y,
+				 struct drm_format_conv_state *fmtcnv_state)
 {
 	unsigned int src_pitch = fb->pitches[0];
 	unsigned int width = drm_rect_width(dst_clip);
 	unsigned int height = drm_rect_height(dst_clip);
 	unsigned int x, y;
+	size_t len = width * sizeof(u32);
+	u32 *sbuf;
+
+	sbuf = drm_format_conv_state_reserve(fmtcnv_state, len, GFP_KERNEL);
+	if (!sbuf)
+		return;
 
 	for (y = 0; y < height; y++) {
 		unsigned int dst_y = dst_clip->y1 + y;
@@ -111,12 +118,11 @@ static void glanda_blit_rect(struct glanda_device *gdev,
 		size_t src_off = (size_t)src_y * src_pitch +
 				 (size_t)(dst_clip->x1 - dst_off_x) * sizeof(u32);
 
-		for (x = 0; x < width; x++) {
-			u32 pixel = iosys_map_rd(src, src_off + x * sizeof(u32), u32);
-			u32 packed;
+		iosys_map_memcpy_from(sbuf, src, src_off, len);
 
-			pixel = le32_to_cpu((__force __le32)pixel);
-			packed = ((pixel >> 12) & 0x0F00) |
+		for (x = 0; x < width; x++) {
+			u32 pixel = le32_to_cpu((__force __le32)sbuf[x]);
+			u32 packed = ((pixel >> 12) & 0x0F00) |
 				((pixel >> 8) & 0x00F0) |
 				((pixel >> 4) & 0x000F);
 
@@ -161,7 +167,7 @@ static void glanda_plane_atomic_update(struct drm_plane *plane,
 			continue;
 
 		glanda_blit_rect(gdev, &dst_clip, &shadow_state->data[0], fb,
-				 dst_off_x, dst_off_y);
+				 dst_off_x, dst_off_y, &shadow_state->fmtcnv_state);
 	}
 
 	drm_dev_exit(idx);
@@ -255,9 +261,6 @@ static int glanda_crtc_enable_vblank(struct drm_crtc *crtc)
 	u32 ier;
 	int idx;
 
-	if (gdev->irq <= 0)
-		return -EINVAL;
-
 	if (!drm_dev_enter(crtc->dev, &idx))
 		return -ENODEV;
 
@@ -298,7 +301,6 @@ static void glanda_crtc_atomic_disable(struct drm_crtc *crtc,
 static void glanda_crtc_atomic_flush(struct drm_crtc *crtc,
 				     struct drm_atomic_state *state)
 {
-	struct glanda_device *gdev = to_glanda(crtc->dev);
 	struct drm_crtc_state *new_state = drm_atomic_get_new_crtc_state(state, crtc);
 	struct drm_pending_vblank_event *event;
 
@@ -308,7 +310,7 @@ static void glanda_crtc_atomic_flush(struct drm_crtc *crtc,
 
 		spin_lock_irq(&crtc->dev->event_lock);
 
-		if (gdev->irq > 0 && drm_crtc_vblank_get(crtc) == 0)
+		if (drm_crtc_vblank_get(crtc) == 0)
 			drm_crtc_arm_vblank_event(crtc, event);
 		else
 			drm_crtc_send_vblank_event(crtc, event);
@@ -378,6 +380,9 @@ static irqreturn_t glanda_irq_handler(int irq, void *dev_id)
 		return IRQ_NONE;
 
 	isr = readl(gdev->mmio_base + REG_ISR);
+	if (unlikely(isr == 0xFFFFFFFF))
+		return IRQ_NONE;
+
 	ier = readl(gdev->mmio_base + REG_IER);
 
 	if (!(isr & ier))
@@ -395,8 +400,6 @@ static irqreturn_t glanda_irq_handler(int irq, void *dev_id)
 static int glanda_drm_init(struct glanda_device *gdev, int irq)
 {
 	int ret;
-
-	gdev->irq = -1;
 
 	writel(0, gdev->mmio_base + REG_IER);
 	writel(0xFFFFFFFF, gdev->mmio_base + REG_ISR);	/* clear flags */
@@ -462,17 +465,13 @@ static int glanda_drm_init(struct glanda_device *gdev, int irq)
 
 	drm_mode_config_reset(&gdev->drm);
 
-	if (irq > 0) {
-		gdev->irq = irq;
-		ret = devm_request_irq(gdev->drm.dev, gdev->irq, glanda_irq_handler,
-				       IRQF_SHARED, "glandagpu", gdev);
-		if (ret) {
-			drm_err(&gdev->drm, "Failed to request IRQ %d\n",
-				gdev->irq);
-			return ret;
-		}
-	} else {
-		drm_warn(&gdev->drm, "No IRQ found, falling back to polling\n");
+	gdev->irq = irq;
+	ret = devm_request_irq(gdev->drm.dev, gdev->irq, glanda_irq_handler,
+			       IRQF_SHARED, "glandagpu", gdev);
+	if (ret) {
+		drm_err(&gdev->drm, "Failed to request IRQ %d\n",
+			gdev->irq);
+		return ret;
 	}
 
 	ret = drm_dev_register(&gdev->drm, 0);
@@ -486,6 +485,7 @@ static int glanda_drm_init(struct glanda_device *gdev, int irq)
 static void glanda_drm_fini(struct glanda_device *gdev)
 {
 	drm_dev_unplug(&gdev->drm);
+	drm_atomic_helper_shutdown(&gdev->drm);
 }
 
 static int glandagpu_probe(struct platform_device *pdev)
@@ -520,10 +520,8 @@ static int glandagpu_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
-	irq = platform_get_irq_optional(pdev, 0);
-	if (irq == -ENXIO)
-		irq = -1;	/* no IRQ resource, fall back to polling */
-	else if (irq < 0)
+	irq = platform_get_irq(pdev, 0);
+	if (irq < 0)
 		return irq;
 
 	return glanda_drm_init(gdev, irq);
@@ -532,6 +530,13 @@ static int glandagpu_probe(struct platform_device *pdev)
 static void glandagpu_remove(struct platform_device *pdev)
 {
 	glanda_drm_fini(platform_get_drvdata(pdev));
+}
+
+static void glandagpu_shutdown(struct platform_device *pdev)
+{
+	struct glanda_device *gdev = platform_get_drvdata(pdev);
+
+	drm_atomic_helper_shutdown(&gdev->drm);
 }
 
 /* Device Tree match table. */
@@ -549,6 +554,7 @@ static struct platform_driver glandagpu_driver = {
 	},
 	.probe = glandagpu_probe,
 	.remove = glandagpu_remove,
+	.shutdown = glandagpu_shutdown,
 };
 
 /* PCI probe path for the QEMU test device, real hardware uses platform_driver */
@@ -600,6 +606,13 @@ static void glandagpu_pci_remove(struct pci_dev *pdev)
 	glanda_drm_fini(pci_get_drvdata(pdev));
 }
 
+static void glandagpu_pci_shutdown(struct pci_dev *pdev)
+{
+	struct glanda_device *gdev = pci_get_drvdata(pdev);
+
+	drm_atomic_helper_shutdown(&gdev->drm);
+}
+
 static const struct pci_device_id glanda_pci_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_REDHAT_QUMRANET, PCI_DEVICE_ID_GLANDA_GPU) },
 	{ }
@@ -612,6 +625,7 @@ static struct pci_driver glandagpu_pci_driver = {
 	.id_table = glanda_pci_ids,
 	.probe = glandagpu_pci_probe,
 	.remove = glandagpu_pci_remove,
+	.shutdown = glandagpu_pci_shutdown,
 };
 #endif /* CONFIG_PCI */
 
